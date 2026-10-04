@@ -94,5 +94,56 @@ class WebApiTests {
                 .andExpect(jsonPath("$[0].packages").value(1));
         mvc.perform(get("/api/admin/policies")).andExpect(status().isOk())
                 .andExpect(jsonPath("$.['fine.daily']").value(0.5));
+        clock.reset();
+    }
+
+    @Test
+    void hotBookDemandAndAcquisitionOverHttp() throws Exception {
+        clock.setFixed(Instant.parse("2026-10-03T08:00:00Z"));
+        try {
+            // 需求调控建议（等待人数/复本/续借限制/调拨成本 → 采购或暂停续借）
+            mvc.perform(get("/api/admin/hot-books/2/demand-advice"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.waitingCount").isNumber())
+                    .andExpect(jsonPath("$.renewLimit").isNumber())
+                    .andExpect(jsonPath("$.suggestPurchase").isBoolean())
+                    .andExpect(jsonPath("$.suggestSuspendRenewal").isBoolean())
+                    .andExpect(jsonPath("$.reasons").isArray());
+
+            // 新增复本分配建议预览
+            mvc.perform(get("/api/admin/hot-books/1/allocation-plan")
+                            .param("arrivalLibraryCode", "CENTRAL").param("copies", "2"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.assignments").isArray())
+                    .andExpect(jsonPath("$.branchWaits").isArray())
+                    .andExpect(jsonPath("$.rules").isArray());
+
+            // 采购到馆（当前无排队 → 上架可借）
+            mvc.perform(post("/api/admin/hot-books/1/acquisitions")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"arrivalLibraryCode\":\"CENTRAL\",\"copies\":1,\"staff\":\"馆员小王\"}"))
+                    .andExpect(status().isCreated())
+                    .andExpect(jsonPath("$.copies[0].barcode").value("N1-0001"))
+                    .andExpect(jsonPath("$.copies[0].assignmentType").value("SHELF"));
+
+            // 馆藏流转记录
+            mvc.perform(get("/api/admin/hot-books/items/N1-0001/movements"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$[0].type").value("ACQUISITION"));
+            mvc.perform(get("/api/admin/hot-books/1/movements")).andExpect(status().isOk());
+
+            // 暂停续借：无理由 → 422；有理由 → 生效
+            mvc.perform(put("/api/admin/hot-books/1/renewal-suspension")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"suspended\":true,\"staff\":\"馆员小王\"}"))
+                    .andExpect(status().isUnprocessableEntity());
+            mvc.perform(put("/api/admin/hot-books/1/renewal-suspension")
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content("{\"suspended\":true,\"staff\":\"馆员小王\",\"reason\":\"预约爆满，加快流转\"}"))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.renewalSuspended").value(true));
+        } finally {
+            clock.reset();
+        }
     }
 }

@@ -14,6 +14,9 @@ import java.util.Optional;
 public interface ItemRepository extends JpaRepository<Item, Long> {
     Optional<Item> findByBarcode(String barcode);
 
+    /** 按条码前缀查找（用于新增复本条码序号生成） */
+    List<Item> findByBarcodeStartingWith(String prefix);
+
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select i from Item i where i.id = :id")
     Optional<Item> lockById(Long id);

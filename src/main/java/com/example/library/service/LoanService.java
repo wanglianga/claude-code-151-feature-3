@@ -60,6 +60,12 @@ public class LoanService {
         if (loan.getStatus() == LoanStatus.CLAIMED_RETURNED) {
             return new RenewCheck(false, "该借阅单存在“声称已还”争议，待馆方核查", null);
         }
+        Bib bib = loan.getItem().getBib();
+        if (bib.isRenewSuspended()) {
+            return new RenewCheck(false,
+                    "该书已暂停续借（热门书需求调控：" + bib.getRenewSuspendReason() + "）",
+                    "bib.renewSuspended=true，等待人数过多时馆员暂停续借以加快复本回转");
+        }
         if (loan.getRenewCount() >= policy.renewLimit()) {
             return new RenewCheck(false,
                     "已达续借次数上限 " + policy.renewLimit() + "（热门书不得被长期独占）",
@@ -354,6 +360,19 @@ public class LoanService {
     @Transactional
     public LoanView renewView(Long loanId) {
         return Views.loan(renew(loanId));
+    }
+
+    /** 续借资格查询（单事务内完成加载与检查，避免懒加载越出会话） */
+    @Transactional(readOnly = true)
+    public java.util.Map<String, Object> renewEligibilityView(Long loanId) {
+        Loan l = get(loanId);
+        RenewCheck c = renewEligibility(l);
+        return java.util.Map.of(
+                "renewable", c.renewable(),
+                "reason", c.reason() == null ? "" : c.reason(),
+                "ruleBasis", c.ruleBasis() == null ? "" : c.ruleBasis(),
+                "dueDate", l.getDueDate(),
+                "renewCount", l.getRenewCount());
     }
 
     @Transactional

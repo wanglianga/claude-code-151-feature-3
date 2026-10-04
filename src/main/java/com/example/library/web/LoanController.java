@@ -1,6 +1,5 @@
 package com.example.library.web;
 
-import com.example.library.domain.Loan;
 import com.example.library.service.LoanService;
 import com.example.library.web.dto.*;
 import io.swagger.v3.oas.annotations.Operation;
@@ -33,15 +32,7 @@ public class LoanController {
     @GetMapping("/{loanId}/renew-eligibility")
     @Operation(summary = "查询续借资格：剩余次数、是否有排队冲突及规则依据")
     public Map<String, Object> eligibility(@PathVariable Long loanId) {
-        Loan l = loans.get(loanId);
-        LoanService.RenewCheck c = loans.renewEligibility(l);
-        return Map.of(
-                "renewable", c.renewable(),
-                "reason", c.reason() == null ? "" : c.reason(),
-                "ruleBasis", c.ruleBasis() == null ? "" : c.ruleBasis(),
-                "dueDate", l.getDueDate(),
-                "renewCount", l.getRenewCount()
-        );
+        return loans.renewEligibilityView(loanId);
     }
 
     @PostMapping("/{loanId}/renewals")

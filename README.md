@@ -1,6 +1,6 @@
 # 城市图书馆跨馆借还调拨 · 逾期罚款与预约排队服务
 
-一个城市级公共图书馆后端：读者可以检索本馆与各分馆库存、预约排队、跨馆调拨借书；馆员与物流员处理出库、到馆、还书核验、罚款赔偿与各类异常；管理端查看调拨效率、热门预约、逾期与丢损。
+一个城市级公共图书馆后端：读者可以检索本馆与各分馆库存、预约排队、跨馆调拨借书；馆员与物流员处理出库、到馆、还书核验、罚款赔偿与各类异常；管理端查看调拨效率、热门预约、逾期与丢损，并对热门书做需求调控（采购建议、暂停续借、新增复本公平分配）。
 
 技术栈：Java 17 · Spring Boot 3.2 · Spring Data JPA · PostgreSQL 16 · Flyway · springdoc OpenAPI 3 / Swagger UI · Maven · Docker Compose。
 
@@ -110,6 +110,42 @@ curl -s "http://localhost:8080/api/admin/policies" | jq
 - 临时闭馆：`POST /api/libraries/{code}/closure` → 在该馆待取预约与临期借阅自动顺延 `closure.graceHours`
 - 罚款人工调整：`POST /api/fines/{id}/adjustments`（REDUCE/WAIVE，必须填理由；原值/新值/操作人/规则依据全部审计留痕，`GET /api/fines/{id}/adjustments` 可查）
 
+## 4.1 热门书预约队列调控（本次新增）
+
+某本新书预约人数过多时，服务综合**等待人数、复本数量、续借限制、跨馆调拨成本**给出调控建议；新增复本到馆后按**预约时间 + 读者所在馆**公平分配，通知说明**预计取书窗口**；馆员可查看分配建议并人工调整，调整原因进入**馆藏流转记录**。
+
+```bash
+# ① 需求调控建议：等待人数/复本/续借限制/调拨成本 → 建议新增采购或暂停续借
+curl -s http://localhost:8080/api/admin/hot-books/1/demand-advice | jq
+
+# ② 暂停该书续借（必填理由，生效后该书一律不可续借；可再次调用恢复）
+curl -s -X PUT http://localhost:8080/api/admin/hot-books/1/renewal-suspension \
+  -H 'Content-Type: application/json' \
+  -d '{"suspended":true,"staff":"馆员老李","reason":"新书预约爆满，暂停续借加快流转"}' | jq
+
+# ③ 新增复本分配建议预览（2 册到总馆）：每册去向、各分馆等待情况、预计取书窗口
+curl -s "http://localhost:8080/api/admin/hot-books/1/allocation-plan?arrivalLibraryCode=CENTRAL&copies=2" | jq
+
+# ④ 采购到馆执行：按建议自动分配；可 overrides 人工调整，与建议不一致时必须填 adjustReason
+curl -s -X POST http://localhost:8080/api/admin/hot-books/1/acquisitions \
+  -H 'Content-Type: application/json' \
+  -d '{"arrivalLibraryCode":"CENTRAL","copies":2,"staff":"馆员小王",
+       "overrides":[{"copyIndex":1,"holdId":2}],"adjustReason":"R002 为老年读者，优先照顾"}' | jq
+
+# ⑤ 馆藏流转记录：采购到馆 / 自动分配 / 人工调整（含调整原因与操作人）
+curl -s http://localhost:8080/api/admin/hot-books/items/N1-0002/movements | jq
+curl -s http://localhost:8080/api/admin/hot-books/1/movements | jq
+```
+
+分配规则（预览接口 `rules` 字段同步返回）：
+
+1. 逐册计算各分馆优先级 =（该馆最早等待者**已等待时长** + **调拨在途时长**）÷（1 + 本轮已分给该馆册数），优先级最高馆的最早预约者得书——预计到手总等待越长的馆越优先；
+2. 每分给某馆一册，该馆优先级折减，**避免新增复本全部流向总馆**等单一馆；
+3. 取书馆即到馆馆的读者无需调拨，直接上架待取；其余锁定条码并生成调拨任务；
+4. 复本多于排队人数时，多余复本在到馆馆上架可借。
+
+分配后读者收到含**预计取书窗口**的通知：本馆读者为“取书窗口 = 现在 ~ 现在+取书时限”；跨馆读者为“预计调拨到馆时刻 ~ 其+取书时限”（`ALLOCATION` 调配通知），书到馆签收后再发 `READY` 取书通知。
+
 ## 5. 领域模型与状态机
 
 - `items` 馆藏条码：`AVAILABLE → LOCKED → IN_TRANSIT → ON_HOLD → CHECKED_OUT`，异常分支 `LOST / DAMAGED`。
@@ -117,6 +153,8 @@ curl -s "http://localhost:8080/api/admin/policies" | jq
 - `transfer_tasks` 调拨：`CREATED → PICKED_UP → ARRIVED`；异常 `LOST / CANCELLED`；按 `transfer_batches` 物流批次聚合包裹。
 - `loans` 借阅：`ACTIVE → RETURNED`；争议 `CLAIMED_RETURNED`；确认丢失 `LOST`。
 - `fines` 罚款/赔偿：类型含逾期、污损、缺页、附件、赔书、物流丢包、人工；承担方 `READER / LIBRARY / LOGISTICS`；状态 `OPEN / PAID / WAIVED / REDUCED`，调整记录在 `fine_adjustments`。
+- `item_movements` 馆藏流转记录：`ACQUISITION` 采购到馆 / `AUTO_ASSIGN` 系统按队列自动分配 / `MANUAL_ADJUST` 馆员人工调整（强制记录调整原因、操作人、系统建议与调整后去向）。
+- `bibs.renew_suspended` 书目级续借暂停：热门书等待人数过多时馆员设置（必填理由），生效期间该书一律不可续借。
 
 一致性设计要点：
 
@@ -137,14 +175,20 @@ curl -s "http://localhost:8080/api/admin/policies" | jq
 | `transfer.protectionRatio` | 0.5 | **外馆保护**：调走 1 册后该馆留存可借数不得低于 ⌈比例×在流转馆藏数⌉，远端分馆库存不会被抽空（单册分馆默认保留） |
 | `transfer.sameRegionHours/otherRegionHours` | 24/72 | 同/跨片区 ETA；选源馆时按 ETA、再按距离取最优，控制物流成本 |
 | `closure.graceHours` | 24 | 临时闭馆时取书时限与应还日期自动顺延 |
+| `demand.purchaseThreshold` | 3 | 热门书调控：未分到复本的排队人数达到该值且在架不足时，建议新增采购（建议册数 = 等待人数 − 在架可借数） |
+| `demand.suspendRenewalThreshold` | 2 | 热门书调控：未分到复本的排队人数达到该值时，建议暂停该书续借 |
 
 每条罚款都携带 `ruleBasis`（规则依据文案），馆员处理异常与人工调整时可直接向读者解释；调减/豁免强制填写理由并保留原值、新值、操作人、时间戳。
 
 ## 7. 本次实际执行过的验证
 
-- `mvn test`：**13 个测试全部通过**（H2 + 真实 Flyway 迁移）：
+- `mvn test`：**19 个测试全部通过**（H2 + 真实 Flyway 迁移，含 V3 热门书调控迁移）：
   - `LibraryFlowTests`（11 个端到端业务流程）：检索视图与外馆保护、跨馆调拨全链路、FIFO 排队与超时释放、保护比例收紧、物流丢包保位重拨与物流赔偿、出库前/在途取消、逾期罚款累计封顶/逾期阻借/排队阻续、污损缺页附件赔偿与退出流转、声称已还三种结案与人工调整审计、临时闭馆双顺延、管理端统计一致性。
-  - `WebApiTests`（2 个 HTTP 冒烟）：REST JSON、参数校验 400、OpenAPI 3 文档与 Swagger UI 可访问。
+  - `HotBookQueueTests`（5 个热门书调控）：需求建议综合等待人数/复本/续借限制/调拨成本并给出采购与暂停续借建议；暂停续借生效与恢复；新增复本按预约时间+读者所在馆公平分配（3 册不全流向总馆：城西/城南调拨、总馆仅 1 册）且通知含预计取书窗口、流转记录留痕；人工调整不填原因被拒绝、填原因后 MANUAL_ADJUST 进入馆藏流转记录；多余复本到馆上架且条码序号连续。
+  - `WebApiTests`（3 个 HTTP 冒烟）：REST JSON、参数校验 400、热门书调控接口（建议/预览/采购/流转记录/暂停续借 422 与生效）、OpenAPI 3 文档与 Swagger UI 可访问。
 - `mvn package`：构建出 `target/city-library.jar`（约 57 MB，可执行 fat jar）。
-- 真实数据库冒烟：已在本机用 **PostgreSQL 15** 实际启动该 JAR（Flyway 建表播种成功），并通过 curl 走通“中文检索（URL 编码）→ 预约锁定城东条码 `C-0004` → 出库批次/包裹号/ETA=72h → 到馆 WEST → 借出（应还日期 +30 天）→ 管理端总览（到馆率 100%）→ Swagger UI / OpenAPI JSON 均 200”全链路。
+- 真实数据库冒烟：已在本机用 **PostgreSQL 15** 实际启动该 JAR（Flyway V1–V3 建表播种成功，`item_movements` 表与 `demand.*` 参数就绪），并通过 curl 走通：
+  - 既有主链路：中文检索（URL 编码）→ 预约锁定城东条码 `C-0004` → 出库批次/包裹号/ETA=72h → 到馆 WEST → 借出（应还日期 +30 天）→ 管理端总览 → Swagger UI / OpenAPI JSON 均 200。
+  - 新增热门书链路：借空《三体》6 册 → 3 位读者排队（2 总馆 1 城西）→ `demand-advice` 返回等待 3/在架 0/调拨不可行并建议采购 3 册+暂停续借 → `allocation-plan` 建议第 1 册调城西、第 2 册留总馆（未全部流向总馆）→ `acquisitions` 人工把第 2 册从 R001 调整为 R002（不填原因 422；填原因后 `N1-0002` 流转记录含 MANUAL_ADJUST+原因）→ R003 收到含预计取书窗口的 `ALLOCATION` 通知、调拨出库到馆后收到 `READY` 通知 → 暂停续借后 `renew-eligibility` 返回不可续借并说明理由，恢复后复原。
+  - 顺带修复并验证：`GET /api/loans/{id}/renew-eligibility` 原实现跨两个只读事务访问懒加载关联会 500（LazyInitializationException），已改为单事务视图方法并复测 200。
 - 未执行项：本环境无 Docker 守护进程，`docker compose up` 未在本机实际运行；Dockerfile 采用标准 Maven 多阶段构建 + eclipse-temurin:17-jre，且 compose 使用的 PostgreSQL 建表迁移脚本已在上述真实 PG 15 实例上验证通过。

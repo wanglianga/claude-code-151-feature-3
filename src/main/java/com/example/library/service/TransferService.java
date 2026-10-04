@@ -133,7 +133,8 @@ public class TransferService {
             h.setExpiresAt(expiry);
             notifications.notify(h.getReader(), "READY", "取书通知",
                     "您跨馆预约的《" + h.getBib().getTitle() + "》已到" + t.getToLibrary().getName()
-                            + "，包裹号 " + packageNo + "，请于 " + expiry + " 前取书。");
+                            + "，包裹号 " + packageNo + "，取书窗口 " + readyAt + " 至 " + expiry
+                            + "，请于 " + expiry + " 前取书。");
         }
         return t;
     }

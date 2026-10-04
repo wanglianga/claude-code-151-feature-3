@@ -131,7 +131,7 @@ public class HoldService {
     }
 
     /** 把具体副本分配给队首预约：本馆直接上架待取，跨馆锁定并生成调拨任务 */
-    private void assignToHold(Hold h, Allocation a) {
+    public void assignToHold(Hold h, Allocation a) {
         Item item = items.lockById(a.item().getId()).orElseThrow();
         h.setItem(item);
         if ("LOCAL".equals(a.mode())) {
@@ -143,7 +143,8 @@ public class HoldService {
             h.setExpiresAt(pickupExpiry(h.getPickupLibrary(), readyAt));
             notifications.notify(h.getReader(), "READY", "取书通知",
                     "您预约的《" + h.getBib().getTitle() + "》已在" + h.getPickupLibrary().getName()
-                            + "预约架，请于 " + h.getExpiresAt() + " 前取书。");
+                            + "预约架，取书窗口 " + readyAt + " 至 " + h.getExpiresAt()
+                            + "，请于 " + h.getExpiresAt() + " 前取书。");
         } else {
             item.setStatus(ItemStatus.LOCKED);
             TransferTask t = new TransferTask();
@@ -280,7 +281,8 @@ public class HoldService {
             next.setExpiresAt(pickupExpiry(next.getPickupLibrary(), readyAt));
             notifications.notify(next.getReader(), "READY", "取书通知",
                     "您排队的《" + next.getBib().getTitle() + "》已到" + next.getPickupLibrary().getName()
-                            + "预约架，请于 " + next.getExpiresAt() + " 前取书。");
+                            + "预约架，取书窗口 " + readyAt + " 至 " + next.getExpiresAt()
+                            + "，请于 " + next.getExpiresAt() + " 前取书。");
         } else {
             locked.setStatus(ItemStatus.LOCKED);
             locked.setCurrentLibrary(sourceLibrary);
