@@ -95,4 +95,74 @@ class WebApiTests {
         mvc.perform(get("/api/admin/policies")).andExpect(status().isOk())
                 .andExpect(jsonPath("$.['fine.daily']").value(0.5));
     }
+
+    @Test
+    void hotBibDemandAdviceAndAllocationFlowOverHttp() throws Exception {
+        clock.setFixed(Instant.parse("2026-10-03T08:00:00Z"));
+
+        // 需求建议列表可访问（新规则参数存在）
+        mvc.perform(get("/api/admin/demand/advice")).andExpect(status().isOk())
+                .andExpect(jsonPath("$[?(@.bibId==1)].title").value(
+                        org.hamcrest.Matchers.hasItem("三体")));
+        mvc.perform(get("/api/admin/policies")).andExpect(status().isOk())
+                .andExpect(jsonPath("$.['acquisition.waitRatio']").value(2.0))
+                .andExpect(jsonPath("$.['allocation.balanceWeight']").value(0.5));
+
+        // 缺少必填字段 → 400
+        mvc.perform(post("/api/admin/acquisitions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"bibId\":1,\"copyCount\":1}"))
+                .andExpect(status().isBadRequest());
+
+        // 登记新购复本到馆 → 201，返回逐册建议
+        mvc.perform(post("/api/admin/acquisitions")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"bibId":1,"copyCount":1,"receivingLibraryCode":"CENTRAL",
+                                 "staff":"采购馆员小冯","note":"热门加购"}
+                                """))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.status").value("RECEIVED"))
+                .andExpect(jsonPath("$.allocations[0].status").value("SUGGESTED"))
+                .andExpect(jsonPath("$.allocations[0].itemBarcode").exists());
+
+        Number acqIdNum = com.jayway.jsonpath.JsonPath.read(
+                mvc.perform(get("/api/admin/acquisitions").param("bibId", "1")).andReturn()
+                        .getResponse().getContentAsString(), "$[0].id");
+        Long acqId = acqIdNum.longValue();
+        Number allocationIdNum = com.jayway.jsonpath.JsonPath.read(
+                mvc.perform(get("/api/admin/acquisitions/" + acqId)).andReturn()
+                        .getResponse().getContentAsString(), "$.allocations[0].id");
+        Long allocationId = allocationIdNum.longValue();
+
+        // 手动改派缺原因 → 400
+        mvc.perform(post("/api/admin/allocations/" + allocationId + "/adjust")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"staff\":\"王馆长\",\"skip\":true}"))
+                .andExpect(status().isBadRequest());
+
+        // 暂停续借 + 流转记录查询
+        mvc.perform(post("/api/admin/bibs/2/renewal-freeze")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"bibId\":2,\"staff\":\"王馆长\",\"reason\":\"红楼梦排队积压\"}"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.active").value(true));
+        // 冻结书目上的在借：续借资格接口在事务内读懒关联，返回 200 且明确拒绝（回归懒加载 500）
+        var checkout = mvc.perform(post("/api/loans/checkouts")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("""
+                                {"readerCardNo":"R001","itemBarcode":"H-0001","libraryCode":"CENTRAL"}
+                                """)).andExpect(status().isCreated()).andReturn();
+        Number hongLouLoanId = com.jayway.jsonpath.JsonPath.read(
+                checkout.getResponse().getContentAsString(), "$.id");
+        mvc.perform(get("/api/loans/" + hongLouLoanId.longValue() + "/renew-eligibility"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.renewable").value(false))
+                .andExpect(jsonPath("$.reason").value(
+                        org.hamcrest.Matchers.containsString("暂停续借")));
+        mvc.perform(get("/api/admin/flow-logs").param("bibId", "2")).andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].action").value("RENEW_FREEZE"));
+        mvc.perform(get("/api/admin/renewal-freezes")).andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].bibId").value(2));
+    }
 }

@@ -27,6 +27,7 @@ public class LoanService {
     private final LibraryRepository libraries;
     private final HoldRepository holds;
     private final ClaimRepository claims;
+    private final HoldRenewalFreezeRepository renewalFreezes;
     private final PolicyService policy;
     private final FineService fines;
     private final HoldService holdService;
@@ -35,6 +36,7 @@ public class LoanService {
 
     public LoanService(LoanRepository loans, ItemRepository items, ReaderRepository readers,
                        LibraryRepository libraries, HoldRepository holds, ClaimRepository claims,
+                       HoldRenewalFreezeRepository renewalFreezes,
                        PolicyService policy, FineService fines, HoldService holdService,
                        NotificationService notifications, AppClock clock) {
         this.loans = loans;
@@ -43,6 +45,7 @@ public class LoanService {
         this.libraries = libraries;
         this.holds = holds;
         this.claims = claims;
+        this.renewalFreezes = renewalFreezes;
         this.policy = policy;
         this.fines = fines;
         this.holdService = holdService;
@@ -52,6 +55,12 @@ public class LoanService {
 
     public record RenewCheck(boolean renewable, String reason, String ruleBasis) {}
 
+    /** 供 HTTP 层按 id 查询：实体加载与懒访问在同一只读事务内完成 */
+    @Transactional(readOnly = true)
+    public RenewCheck renewCheck(Long loanId) {
+        return renewEligibility(get(loanId));
+    }
+
     @Transactional(readOnly = true)
     public RenewCheck renewEligibility(Loan loan) {
         if (loan.getStatus() != LoanStatus.ACTIVE && loan.getStatus() != LoanStatus.CLAIMED_RETURNED) {
@@ -59,6 +68,13 @@ public class LoanService {
         }
         if (loan.getStatus() == LoanStatus.CLAIMED_RETURNED) {
             return new RenewCheck(false, "该借阅单存在“声称已还”争议，待馆方核查", null);
+        }
+        // 热门书暂停续借（馆员按需求建议设置）：冻结期间在借复本一律不得续借，加速回流
+        if (!renewalFreezes.findActiveByBib(loan.getItem().getBib().getId()).isEmpty()) {
+            return new RenewCheck(false,
+                    "《" + loan.getItem().getBib().getTitle() + "》为热门预约书，馆方已暂停续借，"
+                            + "请到期归还，复本将优先分配给排队读者",
+                    "热门书暂停续借：该书目存在生效中的 hold_renewal_freezes 记录");
         }
         if (loan.getRenewCount() >= policy.renewLimit()) {
             return new RenewCheck(false,

@@ -92,11 +92,12 @@ public class CatalogService {
 
     /**
      * 外馆保护：调拨走 1 册后，该馆留存可借数不得低于 ceil(protectionRatio × 该馆在流转馆藏数)，
-     * 防止热门书把远端分馆库存抽空（已丢失/注销副本不计入分母；单副本分馆默认必须留存）。
+     * 防止热门书把远端分馆库存抽空（已丢失/注销、以及新购待馆员确认分配的 RECEIVED 副本不计入分母；
+     * 单副本分馆默认必须留存）。
      */
     public boolean protectionAllows(Long bibId, Library source, long availableNow) {
         long total = items.countCirculatingByBibAndLibrary(bibId, source.getId(),
-                List.of(ItemStatus.LOST, ItemStatus.WITHDRAWN));
+                List.of(ItemStatus.LOST, ItemStatus.WITHDRAWN, ItemStatus.RECEIVED));
         long retained = availableNow - 1;
         return retained >= (long) Math.ceil(policy.protectionRatio() * total);
     }

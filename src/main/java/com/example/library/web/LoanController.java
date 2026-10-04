@@ -31,10 +31,10 @@ public class LoanController {
     }
 
     @GetMapping("/{loanId}/renew-eligibility")
-    @Operation(summary = "查询续借资格：剩余次数、是否有排队冲突及规则依据")
+    @Operation(summary = "查询续借资格：剩余次数、是否有排队冲突/热门书冻结及规则依据")
     public Map<String, Object> eligibility(@PathVariable Long loanId) {
         Loan l = loans.get(loanId);
-        LoanService.RenewCheck c = loans.renewEligibility(l);
+        LoanService.RenewCheck c = loans.renewCheck(loanId);
         return Map.of(
                 "renewable", c.renewable(),
                 "reason", c.reason() == null ? "" : c.reason(),

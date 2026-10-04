@@ -33,7 +33,10 @@ public class PolicyService {
             Map.entry("transfer.sameRegionHours", 24.0),
             Map.entry("transfer.otherRegionHours", 72.0),
             Map.entry("transfer.protectionRatio", 0.5),
-            Map.entry("closure.graceHours", 24.0)
+            Map.entry("closure.graceHours", 24.0),
+            Map.entry("acquisition.waitRatio", 2.0),
+            Map.entry("acquisition.minQueue", 3.0),
+            Map.entry("allocation.balanceWeight", 0.5)
     );
 
     public PolicyService(PolicyRepository policies) {
@@ -61,6 +64,15 @@ public class PolicyService {
     public double feeLogisticsLoss() { return get("fee.logisticsLoss"); }
     public double protectionRatio()  { return get("transfer.protectionRatio"); }
     public long closureGraceHours()  { return (long) get("closure.graceHours"); }
+
+    /** 采购建议阈值：等待人数 / 在流转复本数 高于该比例时建议新增采购 */
+    public double acquisitionWaitRatio() { return get("acquisition.waitRatio"); }
+
+    /** 触发采购建议的最少等待人数 */
+    public int acquisitionMinQueue() { return (int) get("acquisition.minQueue"); }
+
+    /** 新复本分配时“分馆等待时长”相对“读者预约时间”的权重（0~1） */
+    public double allocationBalanceWeight() { return get("allocation.balanceWeight"); }
 
     public long etaHours(boolean sameRegion) {
         return (long) get(sameRegion ? "transfer.sameRegionHours" : "transfer.otherRegionHours");

@@ -35,6 +35,8 @@ class LibraryFlowTests {
     @Autowired PolicyService policy;
     @Autowired LibraryAdminService libraryAdmin;
     @Autowired AdminStatsService stats;
+    @Autowired DemandService demand;
+    @Autowired CopyAllocationService copyAllocation;
     @Autowired AppClock clock;
     @Autowired ItemRepository items;
     @Autowired HoldRepository holds;
@@ -42,6 +44,11 @@ class LibraryFlowTests {
     @Autowired LoanRepository loans;
     @Autowired FineRepository fines;
     @Autowired ClaimRepository claims;
+    @Autowired ReaderRepository readers;
+    @Autowired NotificationRepository notifications;
+    @Autowired CopyAllocationRepository copyAllocations;
+    @Autowired CollectionFlowLogRepository flowLogs;
+    @Autowired HoldRenewalFreezeRepository freezes;
 
     private Instant t0;
 
@@ -382,5 +389,257 @@ class LibraryFlowTests {
         var bib = stats.bibStats(1L);
         assertEquals(6, bib.totalCopies());
         assertNotNull(bib.copiesByStatus().get("CHECKED_OUT"));
+    }
+
+    // ---------- 12. 热门书需求建议 + 暂停续借生效/解除 ----------
+
+    @Test
+    void demandAdvice_purchaseAndFreezeRenewalSuggestions_freezeBlocksRenew() {
+        // R001 借走红楼梦中心馆唯一册，造成 3 人排队且跨馆无可调剂（城北单册受保护）
+        Loan loan = loanService.checkout("R001", "H-0001", "CENTRAL");
+        newReader("R101");
+        newReader("R102");
+        newReader("R103");
+        holdService.placeHold(2L, "R101", "CENTRAL");
+        holdService.placeHold(2L, "R102", "CENTRAL");
+        holdService.placeHold(2L, "R103", "CENTRAL");
+
+        var advice = demand.advice(2L);
+        assertEquals(3, advice.waitingCount());
+        assertEquals(3, advice.queuedUnassigned());
+        assertEquals(2, advice.circulatingCopies());
+        assertTrue(advice.suggestPurchase(), "3 人排队 2 册、在架 0，应建议新增采购");
+        assertTrue(advice.suggestedCopies() >= 1);
+        assertTrue(advice.suggestFreezeRenewal(), "存在可续借在借且有人排队，应建议暂停续借");
+        assertTrue(advice.rationale().contains("等待/复本比"));
+        assertNotNull(advice.byLibrary().get("CENTRAL"));
+        assertTrue(demand.adviceList().stream().anyMatch(a -> a.bibId() == 2L));
+
+        // 按建议暂停续借：在借复本立即不可续借
+        copyAllocation.freezeRenewal(2L, "王馆长", "红楼梦预约积压，暂停续借加速回流");
+        var frozen = loanService.renewEligibility(loans.findById(loan.getId()).orElseThrow());
+        assertFalse(frozen.renewable());
+        assertTrue(frozen.reason().contains("暂停续借"));
+        assertThrows(ApiException.class, () -> loanService.renew(loan.getId()));
+        assertTrue(copyAllocation.isRenewalFrozen(2L));
+
+        // 无原因/无操作人不得设置或解除
+        assertThrows(ApiException.class, () -> copyAllocation.freezeRenewal(3L, "  ", "x"));
+        assertThrows(ApiException.class, () -> copyAllocation.releaseRenewal(2L, "王馆长", " "));
+
+        // 解除后冻结记录归档（该书仍有排队，常规“排队阻续”规则继续生效）
+        copyAllocation.releaseRenewal(2L, "王馆长", "采购复本已到馆，队列开始消化");
+        assertFalse(copyAllocation.isRenewalFrozen(2L));
+        var freezeRow = freezes.findAll().get(0);
+        assertFalse(freezeRow.isActive());
+        assertEquals("采购复本已到馆，队列开始消化", freezeRow.getReleaseReason());
+    }
+
+    // ---------- 13. 新购复本按预约时间+分馆等待均衡分配，不全部流向总馆，通知含取书窗口 ----------
+
+    @Test
+    void newCopies_balancedAcrossBranches_byReservationTimeAndBranchWait() {
+        loanService.checkout("R001", "P-0001", "NORTH"); // 平凡的世界唯一册借出 → 全网无书可分
+        Reader c1 = newReader("R201");
+        Reader c2 = newReader("R202");
+        Reader w1 = newReader("R203");
+        Reader w2 = newReader("R204");
+        Reader s1 = newReader("R205");
+        clock.setFixed(t0);
+        holdService.placeHold(4L, c1.getCardNo(), "CENTRAL");
+        clock.setFixed(t0.plus(1, ChronoUnit.HOURS));
+        holdService.placeHold(4L, c2.getCardNo(), "CENTRAL");
+        clock.setFixed(t0.plus(2, ChronoUnit.HOURS));
+        holdService.placeHold(4L, w1.getCardNo(), "WEST");
+        clock.setFixed(t0.plus(3, ChronoUnit.HOURS));
+        holdService.placeHold(4L, w2.getCardNo(), "WEST");
+        clock.setFixed(t0.plus(5, ChronoUnit.HOURS));
+        holdService.placeHold(4L, s1.getCardNo(), "SOUTH");
+
+        // 纯分馆轮次均衡：3 册应各去一个馆，而不是全部补中心馆
+        policy.update("allocation.balanceWeight", 1.0);
+        Instant decideAt = t0.plus(2, ChronoUnit.DAYS);
+        clock.setFixed(decideAt);
+        var acq = copyAllocation.registerAcquisition(4L, 3, "CENTRAL", "采购馆员小冯", "热门书加购");
+        var rows = copyAllocations.findByAcquisitionIdOrderById(acq.getId());
+        assertEquals(3, rows.size());
+        assertEquals(List.of("CENTRAL", "WEST", "SOUTH"),
+                rows.stream().map(r -> r.getTargetLibrary().getCode()).toList(),
+                "均衡算法按分馆轮次分配，避免全部流向总馆");
+        assertTrue(rows.stream().allMatch(r -> r.getStatus() == AllocationStatus.SUGGESTED));
+        assertEquals(List.of(c1.getId(), w1.getId(), s1.getId()),
+                rows.stream().map(r -> r.getHold().getReader().getId()).toList());
+
+        // 新购复本在确认前为 RECEIVED：不计入在架可借，不会被普通预约/检索抢占
+        assertTrue(rows.stream().allMatch(r -> r.getItem().getStatus() == ItemStatus.RECEIVED));
+        assertEquals(0, catalog.view(4L, "CENTRAL").localAvailable());
+
+        // 预计取书窗口：本地直架 = 到馆 + 3 天；跨馆 = ETA 72h 后再 + 3 天
+        assertEquals(0L, rows.get(0).getEtaHours());
+        assertEquals(72L, rows.get(1).getEtaHours());
+        assertEquals(72L, rows.get(2).getEtaHours());
+        assertEquals(decideAt.plus(3, ChronoUnit.DAYS), rows.get(0).getPickupWindowEnd());
+        assertEquals(decideAt.plus(72, ChronoUnit.HOURS).plus(3, ChronoUnit.DAYS),
+                rows.get(1).getPickupWindowEnd());
+
+        // 馆员一键确认执行
+        copyAllocation.confirmAll(acq.getId(), "王馆长");
+        Hold hCentral = holds.findById(rows.get(0).getHold().getId()).orElseThrow();
+        assertEquals(HoldStatus.READY, hCentral.getStatus());
+        assertEquals(ItemStatus.ON_HOLD, items.findById(rows.get(0).getItem().getId()).orElseThrow().getStatus());
+        assertEquals("CENTRAL", hCentral.getItem().getCurrentLibrary().getCode());
+
+        // 跨馆两册生成调拨任务，馆藏锁定在中心馆
+        var pending = transferService.pendingPickup();
+        assertEquals(2, pending.size());
+        assertEquals(List.of("SOUTH", "WEST"), pending.stream()
+                .sorted(java.util.Comparator.comparing(t -> t.getToLibrary().getCode()))
+                .map(t -> t.getToLibrary().getCode()).toList());
+        assertEquals(List.of("CENTRAL", "CENTRAL"),
+                pending.stream().map(t -> t.getFromLibrary().getCode()).toList());
+
+        // 通知内容包含预计取书窗口（READY 与跨馆 ALLOCATION 两种）
+        var c1Notes = notifications.findByReaderCardNoOrderByCreatedAtDesc(c1.getCardNo());
+        assertTrue(c1Notes.get(0).getMessage().contains("即日至"));
+        var w1Notes = notifications.findByReaderCardNoOrderByCreatedAtDesc(w1.getCardNo());
+        assertTrue(w1Notes.get(0).getMessage().contains("预计在途约 72 小时"));
+        assertTrue(w1Notes.get(0).getMessage().contains("预计取书窗口"));
+
+        // 跨馆包裹出库 → 到馆：读者 READY，取书时限按实际到馆时间重算
+        TransferTask toWest = pending.stream().filter(t -> t.getToLibrary().getCode().equals("WEST")).findFirst().orElseThrow();
+        transferService.pickup(List.of(toWest.getId()), "物流员小赵");
+        TransferTask arrived = transferService.arrive(
+                tasks.findById(toWest.getId()).orElseThrow().getPackageNo());
+        assertEquals(TaskStatus.ARRIVED, arrived.getStatus());
+        Hold hW1 = holds.findAll().stream()
+                .filter(h -> h.getReader().getId().equals(w1.getId())
+                        && h.getBib().getId() == 4L).findFirst().orElseThrow();
+        assertEquals(HoldStatus.READY, hW1.getStatus());
+
+        // 未被服务的剩余排队重新编号：中心馆第二=1；城西 w1 在途仍占位 2，城西第二 w2=3
+        Hold hC2 = holds.findAll().stream()
+                .filter(h -> h.getReader().getId().equals(c2.getId())
+                        && h.getBib().getId() == 4L).findFirst().orElseThrow();
+        Hold hW2 = holds.findAll().stream()
+                .filter(h -> h.getReader().getId().equals(w2.getId())
+                        && h.getBib().getId() == 4L).findFirst().orElseThrow();
+        assertEquals(1, hC2.getQueuePosition());
+        assertEquals(3, hW2.getQueuePosition());
+
+        // 批次完结；流转记录含系统建议与执行
+        assertEquals(AcquisitionStatus.ALLOCATED, acq.getStatus());
+        var logs = flowLogs.findByBibIdOrderByCreatedAtDesc(4L);
+        assertTrue(logs.stream().anyMatch(l -> l.getAction().equals("ALLOCATION_SYSTEM")));
+        assertTrue(logs.stream().anyMatch(l -> l.getAction().equals("ALLOCATION_EXECUTE")));
+    }
+
+    // ---------- 14. 馆员手动改派建议，原因强制进入馆藏流转记录 ----------
+
+    @Test
+    void staffManualAdjust_requiresReasonAndWritesFlowLog_thenExecutesAsManual() {
+        loanService.checkout("R001", "P-0001", "NORTH");
+        Reader r1 = newReader("R301");
+        Reader r2 = newReader("R302");
+        Reader r3 = newReader("R303");
+        clock.setFixed(t0);
+        Hold h1 = holdService.placeHold(4L, r1.getCardNo(), "CENTRAL");
+        clock.setFixed(t0.plus(1, ChronoUnit.HOURS));
+        Hold h2 = holdService.placeHold(4L, r2.getCardNo(), "WEST");
+        clock.setFixed(t0.plus(2, ChronoUnit.HOURS));
+        Hold h3 = holdService.placeHold(4L, r3.getCardNo(), "SOUTH");
+
+        var acq = copyAllocation.registerAcquisition(4L, 2, "CENTRAL", "采购馆员小冯", null);
+        var rows = copyAllocations.findByAcquisitionIdOrderById(acq.getId());
+
+        // 第一册建议默认给最早的 h1（中心馆本地）；馆员要改派给最晚上传的 h3
+        assertEquals(h1.getId(), rows.get(0).getHold().getId());
+        // 无原因、无操作人一律拒绝
+        assertThrows(ApiException.class,
+                () -> copyAllocation.adjustSuggestion(rows.get(0).getId(), h3.getId(), false, null, "王馆长", " "));
+        assertThrows(ApiException.class,
+                () -> copyAllocation.adjustSuggestion(rows.get(0).getId(), h3.getId(), false, null, "  ", "原因"));
+        // 改派给已被其他册占用的预约 → 冲突
+        Long occupiedBySecond = rows.get(1).getHold().getId();
+        assertThrows(ApiException.class,
+                () -> copyAllocation.adjustSuggestion(rows.get(0).getId(), occupiedBySecond, false, null,
+                        "王馆长", "尝试重复占用"));
+
+        copyAllocation.adjustSuggestion(rows.get(0).getId(), h3.getId(), false, null,
+                "王馆长", "读者为残障人士且城南取书，优先照顾");
+        // 第二册馆员选择跳过、留在城北上架
+        copyAllocation.adjustSuggestion(rows.get(1).getId(), null, true, "NORTH",
+                "王馆长", "城北馆下周办书展，留存一册");
+
+        var adjusted = copyAllocations.findById(rows.get(0).getId()).orElseThrow();
+        assertEquals(h3.getId(), adjusted.getHold().getId());
+        assertEquals("SOUTH", adjusted.getTargetLibrary().getCode());
+        assertEquals(AllocationDecidedBy.STAFF, adjusted.getDecidedBy());
+        assertEquals(AllocationStatus.SUGGESTED, adjusted.getStatus(), "改派后仍需馆员确认才执行");
+        var skipped = copyAllocations.findById(rows.get(1).getId()).orElseThrow();
+        assertNull(skipped.getHold());
+        assertEquals("SHELF", skipped.getFulfillMode());
+        assertEquals("NORTH", skipped.getTargetLibrary().getCode());
+
+        // 调整原因进入馆藏流转记录
+        var manualLogs = flowLogs.findByBibIdOrderByCreatedAtDesc(4L).stream()
+                .filter(l -> l.getAction().equals("ALLOCATION_MANUAL")).toList();
+        assertEquals(2, manualLogs.size());
+        assertTrue(manualLogs.stream().anyMatch(l -> l.getDetail().contains("残障人士")));
+        assertTrue(manualLogs.stream().anyMatch(l -> l.getDetail().contains("书展")));
+
+        copyAllocation.confirmAll(acq.getId(), "王馆长");
+        var after = copyAllocations.findByAcquisitionIdOrderById(acq.getId());
+        assertEquals(AllocationStatus.MANUAL, after.get(0).getStatus());
+        assertEquals(AllocationStatus.SKIPPED, after.get(1).getStatus());
+        // 改派给 h3（取书城南）→ 生成中心馆→城南调拨，出库到馆后读者 READY
+        assertEquals(HoldStatus.QUEUED, holds.findById(h3.getId()).orElseThrow().getStatus());
+        TransferTask toSouth = transferService.pendingPickup().stream()
+                .filter(t -> t.getToLibrary().getCode().equals("SOUTH")).findFirst().orElseThrow();
+        transferService.pickup(List.of(toSouth.getId()), "物流员小赵");
+        transferService.arrive(tasks.findById(toSouth.getId()).orElseThrow().getPackageNo());
+        assertEquals(HoldStatus.READY, holds.findById(h3.getId()).orElseThrow().getStatus());
+        assertEquals(ItemStatus.AVAILABLE,
+                items.findById(after.get(1).getItem().getId()).orElseThrow().getStatus());
+        assertEquals("NORTH",
+                items.findById(after.get(1).getItem().getId()).orElseThrow().getCurrentLibrary().getCode());
+    }
+
+    // ---------- 15. 采购批次在执行前取消：复本上架并走常规再分配，取消原因留痕 ----------
+
+    @Test
+    void cancelAcquisition_beforeExecution_shelvesCopiesAndServesQueueWithReason() {
+        loanService.checkout("R001", "P-0001", "NORTH");
+        Reader r1 = newReader("R401");
+        Reader r2 = newReader("R402");
+        clock.setFixed(t0);
+        Hold h1 = holdService.placeHold(4L, r1.getCardNo(), "CENTRAL");
+        clock.setFixed(t0.plus(1, ChronoUnit.HOURS));
+        Hold h2 = holdService.placeHold(4L, r2.getCardNo(), "WEST");
+
+        var acq = copyAllocation.registerAcquisition(4L, 1, "CENTRAL", "采购馆员小冯", null);
+        assertThrows(ApiException.class,
+                () -> copyAllocation.cancelAcquisition(acq.getId(), "王馆长", " "));
+
+        copyAllocation.cancelAcquisition(acq.getId(), "王馆长", "供应商书目版本错误，本批退回重发");
+        assertEquals(AcquisitionStatus.CANCELLED, acq.getStatus());
+        var row = copyAllocations.findByAcquisitionIdOrderById(acq.getId()).get(0);
+        assertEquals(AllocationStatus.SKIPPED, row.getStatus());
+        // 复本在收货馆（中心馆）上架后经常规单点再分配，优先服务取书点同馆的队首
+        assertEquals(HoldStatus.READY, holds.findById(h1.getId()).orElseThrow().getStatus());
+        assertEquals(ItemStatus.ON_HOLD,
+                items.findById(row.getItem().getId()).orElseThrow().getStatus());
+        assertEquals(HoldStatus.QUEUED, holds.findById(h2.getId()).orElseThrow().getStatus());
+        var cancelLog = flowLogs.findByBibIdOrderByCreatedAtDesc(4L).stream()
+                .filter(l -> l.getAction().equals("ACQUISITION_CANCEL")).findFirst().orElseThrow();
+        assertTrue(cancelLog.getDetail().contains("版本错误"));
+    }
+
+    private Reader newReader(String card) {
+        Reader r = new Reader();
+        r.setCardNo(card);
+        r.setName(card);
+        r.setEmail(card + "@example.com");
+        r.setStatus("ACTIVE");
+        return readers.save(r);
     }
 }
